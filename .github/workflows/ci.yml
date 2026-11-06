@@ -30,7 +30,7 @@ jobs:
 
   macos:
     name: macOS app
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build the app (without the Blackmagic RAW SDK, so .braw playback is off in this build)
