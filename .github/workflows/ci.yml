@@ -1,0 +1,48 @@
+# Builds the encoders and the macOS app, and runs the tests, on every push and pull request.
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Encoder and tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install numpy
+        run: python3 -m pip install numpy
+      - name: Build dng2prr and libprr, run the self-test and lossless-JPEG tests
+        run: bash build/linux/build.sh
+      - name: Gyro conversion tests
+        run: cc -O2 -ffp-contract=off -o test_fsg2 tests/test_fsg2.c -lm && ./test_fsg2
+      - name: Build the Blackmagic RAW encoder without Metal (compile check)
+        run: |
+          cd source/braw
+          cc -O2 -Wall -o /tmp/dng2braw dng2braw_cli.c braw_format.c braw_encode.c braw_wb.c fsg2.c dng_frontend.c dng_jpeg.c dng_lj92.c -lm -lpthread
+          /tmp/dng2braw --version
+
+  macos:
+    name: macOS app
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the app (without the Blackmagic RAW SDK, so .braw playback is off in this build)
+        run: bash "build/macos-app/Build cDNG Raw Convert.command" < /dev/null
+      - name: Check the bundled tools run
+        run: |
+          M="macOS/cDNG Raw Convert.app/Contents/MacOS"
+          "$M/dng2prr" --version
+          "$M/dng2braw" --version
+      - name: Upload the app
+        uses: actions/upload-artifact@v4
+        with:
+          name: cDNG-Raw-Convert-macOS-ci
+          path: macOS/
+          retention-days: 14

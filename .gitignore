@@ -1,0 +1,33 @@
+# built app and binaries
+/macOS/
+*.app/
+source/dng2prr
+source/dng2prr.exe
+source/libprr.so
+source/libprr.dylib
+source/libprr.dll
+test_fsg2
+*.o
+*.dSYM/
+
+# Python
+__pycache__/
+*.pyc
+/build/windows/dist/
+/build/windows/build/
+
+# test output and camera files (keep footage out of the repository)
+*.mov
+*.braw
+*.DNG
+*.dng
+*.WAV
+*.wav
+*.jsonl
+tests/validation/out/
+
+# macOS / editors
+.DS_Store
+._*
+.vscode/
+.idea/

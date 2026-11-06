@@ -1,0 +1,48 @@
+name: Bug report
+description: Something doesn't work, or a converted file looks or behaves wrong.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for reporting. Please don't attach whole clips here; a frame, a screenshot or a link is enough.
+  - type: input
+    id: version
+    attributes:
+      label: cDNG Raw Convert version
+      description: The title bar or the Log panel shows it, e.g. 0.6.11.
+    validations:
+      required: true
+  - type: dropdown
+    id: output
+    attributes:
+      label: Output format
+      options: [Apple ProRes RAW, Blackmagic RAW, Compressed CinemaDNG, Viewer / playback only, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: "1. Open clip …  2. Output settings …  3. Render …"
+  - type: textarea
+    id: clip
+    attributes:
+      label: The clip
+      description: Recording mode (UHD, DCI 4K, FHD, OG3K, OG2K…), bit depth, frame rate, lens, fpSup build (e.g. fpsup-v4-gyro2), and how it was recorded (internal SSD/card, Video Assist, Ninja V…).
+  - type: textarea
+    id: environment
+    attributes:
+      label: Your system
+      description: Mac model and macOS version; DaVinci Resolve and Gyroflow plugin versions if relevant.
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Copy from the app's Log panel, or the command-line output.
+      render: text

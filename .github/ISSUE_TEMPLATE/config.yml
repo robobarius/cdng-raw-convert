@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: fpSup (the SIGMA fp firmware mods)
+    url: https://ijigen.github.io/fpSup/
+    about: Questions about fpSup itself, Gyro2 recording or camera firmware belong to the fpSup project.
