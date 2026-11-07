@@ -1,3 +1,6 @@
+<img width="1024" height="1024" alt="cDNG Raw Convert 0 6 5 icon" src="https://github.com/user-attachments/assets/ab35c3a0-7bed-4daf-b7b1-4d6d7dfa354b" />
+<img width="1920" height="1080" alt="cDNG Raw Convert 0 6 5 gui" src="https://github.com/user-attachments/assets/7cba9a4f-4428-4824-b431-3b8c45ea9d5b" />
+
 # cDNG Raw Convert
 
 [![Build and test](https://github.com/robobarius/cdng-raw-convert/actions/workflows/ci.yml/badge.svg)](https://github.com/robobarius/cdng-raw-convert/actions/workflows/ci.yml)
