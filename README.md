@@ -1,13 +1,20 @@
-<img width="270" height="270" alt="cDNG Raw Convert 0 6 5 icon" src="https://github.com/user-attachments/assets/ab35c3a0-7bed-4daf-b7b1-4d6d7dfa354b" />
-<img width="480" height="270" alt="cDNG Raw Convert 0 6 5 gui" src="https://github.com/user-attachments/assets/7cba9a4f-4428-4824-b431-3b8c45ea9d5b" />
+<p align="center">
+  <img src="build/macos-app/AppIcon.png" width="160" height="160" alt="cDNG Raw Convert app icon">
+</p>
 
-# cDNG Raw Convert
+<h1 align="center">cDNG Raw Convert</h1>
 
-[![Build and test](https://github.com/robobarius/cdng-raw-convert/actions/workflows/ci.yml/badge.svg)](https://github.com/robobarius/cdng-raw-convert/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/robobarius/cdng-raw-convert?include_prereleases)](https://github.com/robobarius/cdng-raw-convert/releases)
-[![Licence: GPL-3.0-or-later](https://img.shields.io/badge/licence-GPL--3.0--or--later-blue)](NOTICE.md)
+<p align="center">
+  <a href="https://github.com/robobarius/cdng-raw-convert/actions/workflows/ci.yml"><img src="https://github.com/robobarius/cdng-raw-convert/actions/workflows/ci.yml/badge.svg" alt="Build and test"></a>
+  <a href="https://github.com/robobarius/cdng-raw-convert/releases"><img src="https://img.shields.io/github/v/release/robobarius/cdng-raw-convert?include_prereleases" alt="Latest release"></a>
+  <a href="NOTICE.md"><img src="https://img.shields.io/badge/licence-GPL--3.0--or--later-blue" alt="Licence: GPL-3.0-or-later"></a>
+</p>
 
 **Version 0.6.11, proof of concept.** SIGMA fp CinemaDNG to Apple ProRes RAW, Blackmagic RAW (beta) and compressed CinemaDNG, for the [fpSup](https://ijigen.github.io/fpSup/) community.
+
+<p align="center">
+  <img width="480" height="270" alt="The cDNG Raw Convert app (0.6.5)" src="https://github.com/user-attachments/assets/7cba9a4f-4428-4824-b431-3b8c45ea9d5b">
+</p>
 
 **cDNG Raw Convert** converts a **SIGMA fp CinemaDNG clip** (a folder of DNG frames plus its WAV) into **one Apple ProRes RAW `.mov`**, with the audio, timecode, metadata and fpSup Gyro2 gyro data inside. DaVinci Resolve opens the file natively as ProRes RAW, with working Camera Raw controls for ISO, white balance and exposure. Since 0.4, it can instead make **one Blackmagic RAW `.braw`** per clip, with the audio, timecode and (new in 0.5) gyro data inside. It can also re-compress a clip as **compressed CinemaDNG**, in slimRAW-style lossless and lossy modes.
 
