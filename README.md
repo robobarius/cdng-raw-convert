@@ -12,13 +12,13 @@
 
 **Version 0.6.11, proof of concept.** SIGMA fp CinemaDNG to Apple ProRes RAW, Blackmagic RAW (beta) and compressed CinemaDNG, for the [fpSup](https://ijigen.github.io/fpSup/) community.
 
-<p align="center">
-  <img width="480" height="270" alt="The cDNG Raw Convert app (0.6.5)" src="https://github.com/user-attachments/assets/7cba9a4f-4428-4824-b431-3b8c45ea9d5b">
-</p>
-
 **cDNG Raw Convert** converts a **SIGMA fp CinemaDNG clip** (a folder of DNG frames plus its WAV) into **one Apple ProRes RAW `.mov`**, with the audio, timecode, metadata and fpSup Gyro2 gyro data inside. DaVinci Resolve opens the file natively as ProRes RAW, with working Camera Raw controls for ISO, white balance and exposure. Since 0.4, it can instead make **one Blackmagic RAW `.braw`** per clip, with the audio, timecode and (new in 0.5) gyro data inside. It can also re-compress a clip as **compressed CinemaDNG**, in slimRAW-style lossless and lossy modes.
 
 It comes as a macOS app, plus a command-line encoder called `dng2prr` (macOS and Linux) and a Python version with a small window app for Windows and Linux.
+
+<p align="center">
+  <img width="480" height="270" alt="The cDNG Raw Convert app (0.6.5)" src="https://github.com/user-attachments/assets/7cba9a4f-4428-4824-b431-3b8c45ea9d5b">
+</p>
 
 > **Experimental and community-built.** These are **not Apple's or Blackmagic Design's encoders**, and they are not licensed, certified or endorsed by Apple or Blackmagic Design. The Blackmagic RAW encoder (`dng2braw`, from the fpSup dng2braw project) was built by black-box testing against Blackmagic's decoder and Video Assist recordings. The format was worked out from FFmpeg's open-source ProRes RAW decoder, and Apple's behaviour was calibrated by measuring DaVinci Resolve with test patterns. It has been tested only in **DaVinci Resolve Studio 21.1.1 on macOS**. **Keep your original DNGs.**
 
