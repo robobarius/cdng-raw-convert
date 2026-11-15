@@ -1376,11 +1376,66 @@ with a different curve; generation 5 is the one that matches.
 - **Session cache:** gyroflow-core keeps each file's parsed telemetry until the host quits, keyed by path, load options, frame size and frame rate (`GyroSource::parse_telemetry_file`), not by content. A .braw first loaded without motion data (0.6.9's, from Gyro2 v0.2.0 footage) parses successfully and is cached; a corrected file written over it isn't read until Resolve restarts. The plugin's "Status: OK" only says the timestamps are reliable, true for every Blackmagic file, with or without readings. The log (`~/Library/Application Support/Gyroflow/gyroflow-openfx.log`) shows a fresh parse as "camera_identifier: Camera ID Brand: Blackmagic…" lines after "Loading video file"; a cached load has none.
 - **Checked** in the user's B001_003.braw (147 frames, 0.6.10): 15 321 gyroscope and 15 321 accelerometer readings at 2499 Hz over the whole clip, gyro RMS 1–3 °/s, gravity +9.6 m/s² on Y. **Not yet seen:** a fresh load of a 0.6.11 file stabilising in the plugin. The app labels the BRAW output BETA until then. Resolve's own gyro stabilisation for a non-Blackmagic camera is still untested. cDNG Raw Convert FINDINGS 14–15 have the Gyro2 v0.2.0 format change behind this.
 
+## 46. Every frame size: padding, crop origin, strips and bands, checked through the SDK (14–15 Nov, dng2braw 0.16)
+
+Until 0.15, dng2braw wrote only fp UHD and OG3K and refused other recording modes (exit code 3, "not supported yet"),
+so 3K (3032 wide), FHD, DCI 4K and fpSup custom sizes such as the RITZ 3840×2560 clips gave no .braw. With no
+Video Assist recordings in those modes, the rules were worked out by putting frames of every size through
+Blackmagic's own decoder (`tests/braw_sizes.py`): dng2braw's test hook `DNG2BRAW_TEST_SIZE=WxH[+L+T]` crops or
+repeats the OG3K clip's frames to any size and crop margins, the Blackmagic RAW SDK decodes the result (CPU, Gen 5,
+Film), and the picture is compared with the decode of the clip at its own size, photosite for photosite where both
+show the same part of the scene. What was found:
+- **Coded size: both dimensions rounded up to 16**, the extra photosites filled with the nearest ones of the same
+  colour. Widths that aren't a multiple of 16 (3032, 3000) need right-hand padding; coding them unpadded gave a
+  shifted, wrongly coloured picture.
+- **The decoder starts the picture at `crop_origin` rounded down to a multiple of 8, and never before 8**, and shows
+  `crop_size` rounded down to a multiple of 8. A coded picture whose margin was 5 lines (the fp's DefaultCropOrigin is
+  (8, 5)) shifted the colours when it wasn't padded: coded with 0 lines above it, mean error 1.23 of 255 (max 31); with
+  2 lines above (as the Video Assist's frames are, FINDINGS 23), 0.00. So dng2braw now moves the image right and
+  down by whole Bayer pairs (0–8 photosites) until its DefaultCrop margin lands on such a position, and writes
+  `crop_origin` there. Odd margins can't land exactly and end up one photosite off, as in a Video Assist recording.
+  Checked with left/top margins 0–20 (mean error 0.26–0.28 of 255 for the shifted cases, from the different slice
+  boundaries; 0.000 where the slices line up), always at the expected position.
+- **No more than 32 bands of slices.** 34 or more (a 3000-line frame in 72-line bands is 42) crash the decoder
+  (the SDK process ends with a segmentation fault). Taller frames get taller bands instead (multiples of 8): 80 lines
+  at 2416, 96 at 3008, 136 at 4336. The Video Assist writes 31 bands, camera files 32.
+- **Fewer strips for narrow frames:** 5 strips down to 1280 wide (256 each), then as many 256+-wide strips as fit
+  (1008: 3 × 336; 640: 2; 320 and narrower: 1).
+- The `.mov` track size and the picture size in the metadata are the decoded picture (multiples of 8), and the gyro
+  readout is per picture row of that.
+
+**Decoded correctly** (mean difference from the reference decode 0.02–0.12 of 255, max 1–2, both frames):
+1936×1090 (FHD), 2016×1340, 2048×1080, 3000×2000, 3008×2000, 3024×2010 (OG3K, 0.000), 3032×2020 (3K), 3040×2010,
+3856×2170 (UHD), 3840×2560 and 3856×2570 (fpSup RITZ-style 3:2), 3856×3000, 4112×2170 (DCI 4K), 4496×3000,
+5952×3968, 6000×4000, 6016×4010 (6K open gate), 8192×4320, and small sizes down to 258×146. The decoder refuses
+64×64 (0x80000008), so dng2braw refuses images under 240×128.
+**On a real recording,** the 17 Sep 3K clip (B001_013, 3032×2020, ISO 400) made a .braw that Blackmagic's decoder
+**crashed on** (segmentation fault inside the SDK, in `CreateJobDecodeAndProcessFrame`), at every size, rate and
+setting, and even as a flat frame. Splicing the frame's parts between this file and a working one isolated it: the
+slices and the clip metadata were fine; the crash followed the frame's 256-byte `bmdf` box, and in it only **`agpf`,
+the analog gain**. Writing other values into `agpf` (the decoded picture is the same whatever it holds, mean 143.085
+±0.002 of 255):
+- accepted: **2^(k/3) for k = 0 to 21** (1.0, 1.26, 1.587, 2.52, 3.17, 4.0, 5.04, … 128), within about 1 % (1.259
+  and 1.26 work, 1.25 doesn't) — **except 2.0**, which crashes too;
+- everything else crashes, including **every value below 1**.
+
+dng2braw wrote ISO/800 × 2^(1/3), the Video Assist's value (1.26 at ISO 800, 5.04 at 3200, FINDINGS 10), which lands
+on an accepted step only at ISO 800 × 2^n: 800, 1600, 3200, 6400, 12800, 25600. **So clips shot at ISO 100–640,
+1000, 1250, 2000, 2500… gave .braw files that Blackmagic's software couldn't decode** (the clips this encoder was
+calibrated and tested on were at ISOs on accepted steps). dng2braw 0.16 puts the gain on the nearest accepted step (ISO 400 → 1.0, 1250 → 1.587 or 2.52
+either side of 2.0), in the frames and in the clip's `analog_gain`; `isoe` keeps the real ISO. The 3K clip then
+decodes (frames 0, 111 and 222 on the CPU and the GPU, 3000×2000), Resolve 21.2 imports it as Blackmagic RAW
+3000×2000, 223 frames, and frames at all 23 of the fp's ISOs from 100 to 25600 decode.
+
+So `braw_size_tested()` now accepts coded sizes from 256×144 to 8192×4352, the app no longer skips any fp recording
+mode, and the probe reports `braw_supported` for all of them.
+
 ## Next
 
 1. **More paired references** (needs a shoot):
    - Video Assist + internal DNG at 5600 K daylight and at ISO 100, 3200 and 6400 (colour and gain at other settings);
-   - DCI 4K, FHD and open-gate recordings (layouts).
+   - ~~DCI 4K, FHD and open-gate recordings (layouts)~~ (layouts checked through the SDK, finding 46; colour at
+     those sizes still from the UHD fit).
 2. ~~Audio~~ (done, finding 39). ~~Gyro~~ (done, finding 41; Gyroflow plugin v0.1.10 still to confirm, finding 45).
 3. ~~Merge into cDNG Raw Convert~~ (done: cDNG Raw Convert 0.4 has Blackmagic RAW as its third output).
 4. **Optional:** per-edge filter strengths (rate-distortion optimised), a perceptual matrix, and GPU entropy coding for
