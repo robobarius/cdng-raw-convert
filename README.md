@@ -10,7 +10,7 @@
   <a href="NOTICE.md"><img src="https://img.shields.io/badge/licence-GPL--3.0--or--later-blue" alt="Licence: GPL-3.0-or-later"></a>
 </p>
 
-**Version 0.6.11, proof of concept.** SIGMA fp CinemaDNG to Apple ProRes RAW, Blackmagic RAW (beta) and compressed CinemaDNG, for the [fpSup](https://ijigen.github.io/fpSup/) community.
+**Version 0.6.12, proof of concept.** SIGMA fp CinemaDNG to Apple ProRes RAW, Blackmagic RAW (beta) and compressed CinemaDNG, for the [fpSup](https://ijigen.github.io/fpSup/) community.
 
 **cDNG Raw Convert** converts a **SIGMA fp CinemaDNG clip** (a folder of DNG frames plus its WAV) into **one Apple ProRes RAW `.mov`**, with the audio, timecode, metadata and fpSup Gyro2 gyro data inside. DaVinci Resolve opens the file natively as ProRes RAW, with working Camera Raw controls for ISO, white balance and exposure. Since 0.4, it can instead make **one Blackmagic RAW `.braw`** per clip, with the audio, timecode and (new in 0.5) gyro data inside. It can also re-compress a clip as **compressed CinemaDNG**, in slimRAW-style lossless and lossy modes.
 
@@ -126,7 +126,8 @@ The `.braw` output is made by the bundled `dng2braw` encoder (sources in `source
   - The Blackmagic RAW SDK also reports the motion data. Whether Resolve's own gyro stabilisation accepts it for a non-Blackmagic camera hasn't been tested yet.
 - **Speed** on an M1 Max: about 70 fps at 5:1 with the GPU, about 33 fps on the CPU only.
 - **Limits:**
-  - fp UHD (3840×2160) and open gate OG3K (3008×2000, new in 0.5) clips so far; other modes are reported as "not supported yet" and skipped;
+  - every fp recording mode since 0.6.12 (FHD, DCI 4K, UHD, 3K, open gate and fpSup custom sizes), checked through Blackmagic's decoder; the decoded picture is cropped to multiples of 8 (3K: 3000×2000);
+  - before 0.6.12, clips shot below ISO 800 (or at ISO 1000, 1250, 2000…) made files Blackmagic's software couldn't decode: convert them again;
   - the colour fit was made at 3200 K, ISO 800;
   - tested in DaVinci Resolve Studio 21 on macOS only.
 
@@ -154,7 +155,7 @@ These apply to the native encoder (the app and `dng2prr`); the Python version wr
 
 ## Compressed CinemaDNG
 
-Each DNG is rewritten with its image stored as compressed tiles (256×256), the way DNG converters do it.
+Each DNG is rewritten with its image stored as compressed tiles (256×256; with Premiere compatibility, a whole image high), the way DNG converters do it.
 
 **What's kept:**
 - Every other tag is copied unchanged: colour matrices, white balance, EXIF, timecode, lens corrections and Sigma's private data.
@@ -176,7 +177,13 @@ Each DNG is rewritten with its image stored as compressed tiles (256×256), the 
   - **Lossy modes** keep the average brightness within 0.7%. Measured on a dark tungsten frame, the difference from the original is roughly 37 dB (VBR HQ) and 31 dB (7:1) PSNR, on a square-root (gamma 2) scale.
 - **Other apps:** lossy CinemaDNG is less widely supported than lossless, so check your other software before relying on it.
 
-**Compared with slimRAW:** the modes are named after slimRAW's, but this is an independent implementation. Sizes and quality won't match slimRAW exactly, and slimRAW's "Premiere compatibility" and "Downscale 2X" options aren't available.
+**Options** (new in 0.6.12, as in slimRAW; FINDINGS 16 has the details):
+- **Adobe Premiere CC compatibility** (lossless modes): tiles a whole image high, a whole-number black level and an even crop origin, the layout slimRAW uses for Premiere Pro. Not yet checked in Premiere itself.
+- **Downscale 2X:** half-size raw (Bayer) CinemaDNG for raw proxies, in a folder ending `-half`. Bit-identical to slimRAW 1.10's downscale.
+- **Generate checksums:** `checksum.sr` (CRC-32C of every file, slimRAW's format) in each output folder.
+- **Run a verification pass** (with checksums): decodes every tile again, then reads every file back from the drive and checks its checksum.
+
+**Compared with slimRAW:** the modes and options are named after slimRAW's, but this is an independent implementation. Lossless files are bit-exact either way, but sizes and lossy quality won't match slimRAW exactly.
 
 ## Option B: Linux and Windows (experimental)
 
@@ -284,7 +291,7 @@ source/
   dng_jpeg.c       JPEG codecs for compressed DNG output: lossless encoder, 12-bit lossy encoder/decoder
   fsg2.c, fsg2.h   fpSup Gyro2 data -> Gyroflow Protobuf (port of the fpSup Gyroflow plugin's decoder, v0.1.10)
   dng2prr_gui.py   cross-platform window (Tkinter) for Windows/Linux
-  braw/            the Blackmagic RAW encoder dng2braw (C + Metal), from the fpSup dng2braw project; its findings (1–45) in braw/FINDINGS.md
+  braw/            the Blackmagic RAW encoder dng2braw (C + Metal), from the fpSup dng2braw project; its findings (1–46) in braw/FINDINGS.md
 build/
   macos-app/       the native macOS app (SwiftUI source, icon + make_icon.py, "Build cDNG Raw Convert.command")
   macos/           the older drag-and-drop droplet (needs Python)

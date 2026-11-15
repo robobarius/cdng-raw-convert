@@ -2,7 +2,7 @@
 // (SIGMA fp CinemaDNG -> Apple ProRes RAW, Blackmagic RAW, or compressed CinemaDNG).
 // Part of the fpSup community tools. LGPL-2.1-or-later. Experimental; not Apple or Blackmagic Design software.
 //
-// Layout (0.6 UI mockup "Option A", revised in 0.6.1-0.6.11): one dark, dense page in the style of a colour/edit suite.
+// Layout (0.6 UI mockup "Option A", revised in 0.6.1-0.6.12): one dark, dense page in the style of a colour/edit suite.
 //   left    Media Storage (volumes, cards, folders; click a clip to view it) above the Job Queue
 //   centre  Viewer: plays DNG clips (dng_view helper), .braw (Blackmagic RAW SDK via braw_view) and .mov
 //           (AVFoundation) with sound, through an optional monitoring LUT and de-squeeze; the Log below.
@@ -25,7 +25,7 @@ import ImageIO
 import UniformTypeIdentifiers
 import CoreVideo
 
-let appVersion = "0.6.11"
+let appVersion = "0.6.12"
 
 // MARK: - Theme
 
@@ -1644,7 +1644,8 @@ struct DngMode: Identifiable, Hashable {
     ]
     static let legacySuffixes = ["LOSSLESS", "LOG10", "VBRHQ", "VBRLT", "3TO1", "4TO1", "5TO1", "7TO1"]   /* before 0.6.1 */
     /// folders this app made next to a clip, skipped when searching for clips
-    static func isOutputFolder(_ name: String) -> Bool { all.contains { name.hasSuffix("_" + $0.suffix) } || legacySuffixes.contains { name.hasSuffix("_" + $0) } }
+    static func isOutputFolder(_ name: String) -> Bool { all.contains { name.hasSuffix("_" + $0.suffix) || name.hasSuffix("_" + $0.suffix + "-half") } || legacySuffixes.contains { name.hasSuffix("_" + $0) } }
+    var isLossy: Bool { !(arg == "lossless" || arg == "log10") }
 }
 
 enum ExistingPolicy: Int, CaseIterable {
@@ -1671,6 +1672,9 @@ final class OutputModel: ObservableObject {
     @Published var sidecars: Bool { didSet { d.set(sidecars, forKey: "copySidecars") } }
     @Published var copyOther: Bool { didSet { d.set(copyOther, forKey: "copyOther") } }
     @Published var verify: Bool { didSet { d.set(verify, forKey: "verify") } }
+    @Published var checksums: Bool { didSet { d.set(checksums, forKey: "dngChecksums") } }
+    @Published var premiere: Bool { didSet { d.set(premiere, forKey: "dngPremiere") } }
+    @Published var downscale: Bool { didSet { d.set(downscale, forKey: "dngDownscale") } }
     @Published var gpu: Bool { didSet { d.set(gpu, forKey: "useGPU") } }
     @Published var nextToClip: Bool { didSet { d.set(nextToClip, forKey: "nextToClip") } }
     @Published var destination: String { didSet { d.set(destination, forKey: "destination") } }
@@ -1688,6 +1692,7 @@ final class OutputModel: ObservableObject {
         dngMode = s("dngMode", "lossless"); greyCard = b("wbOverride", false); wbR = s("wbR", "0.737"); wbB = s("wbB", "0.367")
         audio = b("embedAudio", true); gyro = b("embedGyro", true); sidecars = b("copySidecars", true)
         copyOther = b("copyOther", true); verify = b("verify", true); gpu = b("useGPU", true)
+        checksums = b("dngChecksums", true); premiere = b("dngPremiere", false); downscale = b("dngDownscale", false)
         nextToClip = b("nextToClip", true); destination = s("destination", ""); policy = i("policy", 0); openWhenDone = b("openWhenDone", false); squeeze = b("writeSqueeze", true)
     }
     var neutral: String? {
@@ -1701,12 +1706,13 @@ final class OutputModel: ObservableObject {
         switch format {
         case .proresRaw: return "ProRes RAW · \(Quality(rawValue: quality)?.label ?? "")"
         case .braw: return "Blackmagic RAW · \(brawLabel)"
-        case .cdng: return "CinemaDNG · \(dng.label)"
+        case .cdng: return "CinemaDNG · \(dng.label)" + (downscale ? " · ½" : "") + (premiere && !dng.isLossy ? " · Premiere" : "")
         }
     }
     func snapshot() -> OutputSnapshot {
         OutputSnapshot(format: format, quality: quality, brawArgs: (brawByQuality ? ["--quality", "Q\(brawQ)"] : ["--ratio", String(brawRatio)]) + ["--viewing", brawFilm ? "film" : "rec709"],
-                       dng: dng, neutral: neutral, audio: audio, gyro: gyro, squeeze: squeeze, sidecars: sidecars, copyOther: copyOther, verify: verify, gpu: gpu,
+                       dng: dng, neutral: neutral, audio: audio, gyro: gyro, squeeze: squeeze, sidecars: sidecars, copyOther: copyOther, verify: verify && checksums, gpu: gpu,
+                       checksums: checksums, premiere: premiere && !dng.isLossy, downscale: downscale,
                        destination: nextToClip || destination.isEmpty ? nil : URL(fileURLWithPath: destination),
                        policy: ExistingPolicy(rawValue: policy) ?? .skip, summary: summary)
     }
@@ -1715,6 +1721,8 @@ final class OutputModel: ObservableObject {
 struct OutputSnapshot {
     let format: OutputFormat; let quality: Int; let brawArgs: [String]; let dng: DngMode; let neutral: String?
     let audio, gyro, squeeze, sidecars, copyOther, verify, gpu: Bool
+    let checksums, premiere, downscale: Bool
+    var dngSuffix: String { dng.suffix + (downscale ? "-half" : "") }
     let destination: URL?; let policy: ExistingPolicy; let summary: String
 }
 
@@ -1918,7 +1926,7 @@ final class Engine: ObservableObject {
         else {
             var parent = clipURL.deletingLastPathComponent()
             if !fm.isWritableFile(atPath: parent.path) { parent = fm.homeDirectoryForCurrentUser.appendingPathComponent("Movies/cDNG Raw Convert") }
-            outClip = parent.appendingPathComponent(clipURL.lastPathComponent + "_" + s.dng.suffix)
+            outClip = parent.appendingPathComponent(clipURL.lastPathComponent + "_" + s.dngSuffix)
         }
         if fm.fileExists(atPath: outClip.path), s.policy == .keepBoth {
             var n = 2; let base = outClip; while fm.fileExists(atPath: outClip.path) { outClip = URL(fileURLWithPath: base.path + "_\(n)"); n += 1 }
@@ -1926,18 +1934,23 @@ final class Engine: ObservableObject {
         append("    → \(outClip.path)")
         var args = ["--cdng", outClip.path, clipURL.path, "--cdng-mode", s.dng.arg, "--progress-every", "1"]
         if s.copyOther { args.append("--copy-other") }
-        if s.verify { args.append("--verify") }
+        if s.premiere { args.append("--premiere") }
+        if s.downscale { args.append("--downscale") }
+        if s.checksums { args.append("--checksums") }
+        if s.verify { args += ["--verify", "--verify-pass"] }
         if !s.gpu { args.append("--cpu") }
         if s.policy == .skip { args.append("--skip-existing") }
         var lastLogged = -1
         let rc = run("dng2prr", args) { line in
             if line.contains("frame ") && line.contains("/") { self.progress(j, line, &lastLogged) }
+            else if line.hasPrefix("  verified ") { return }
             else if !line.hasPrefix("copied ") && !line.contains("frame(s), CinemaDNG") { self.append("    " + line) }
         }
         if let names = try? fm.contentsOfDirectory(atPath: outClip.path) {
             for n in names where n.hasPrefix(".") && n.hasSuffix(".partial") { try? fm.removeItem(at: outClip.appendingPathComponent(n)) }
         }
         if stopRequested { append("    stopped; frames written so far are complete DNG files."); return (.stopped, "stopped", outClip) }
+        if rc == 4 { append("    VERIFICATION FAILED: a file on the drive doesn't match its checksum (see above)."); return (.failed, "checksum error", outClip) }
         if rc != 0 { append("    FAILED (encoder exit code \(rc))."); return (.failed, "failed (\(rc))", nil) }
         return (.done, "done", outClip)
     }
@@ -2404,7 +2417,7 @@ struct JobRow: View {
             }.frame(width: 12, height: 14)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(job.settings.format == .cdng ? "\(job.name) → \(job.name)_\(job.settings.dng.suffix)" : "\(job.name) → .\(job.settings.format.movieExtension)")
+                    Text(job.settings.format == .cdng ? "\(job.name) → \(job.name)_\(job.settings.dngSuffix)" : "\(job.name) → .\(job.settings.format.movieExtension)")
                         .font(Th.f(11)).lineLimit(1).truncationMode(.middle)
                     Spacer(minLength: 4)
                     if job.state == .rendering { Text(job.rate).font(Th.f(10.5)).foregroundColor(Th.dim).lineLimit(1).fixedSize() }
@@ -2648,8 +2661,19 @@ struct OutputSidebar: View {
                     VStack(alignment: .leading, spacing: 0) { ForEach(DngMode.all.suffix(4)) { m in radio(m) } }
                 }
                 Text(o.dng.note).font(Th.f(10.5)).foregroundColor(Th.dim2).fixedSize(horizontal: false, vertical: true).padding(.top, 3)
-                CheckRow(label: "Copy non-DNG files (WAV, XMP…)", on: $o.copyOther).padding(.top, 4)
-                CheckRow(label: "Run a verification pass", on: $o.verify, hint: "Decodes every tile again after compressing. Lossless modes must match exactly.")
+                CheckRow(label: "Adobe Premiere CC compatibility", on: Binding(get: { o.premiere && !o.dng.isLossy }, set: { o.premiere = $0 }), disabled: o.dng.isLossy,
+                         hint: o.dng.isLossy ? "Premiere Pro reads only lossless CinemaDNG: choose Lossless or Lossless 10-bit log."
+                                             : "Lays the image out the way Premiere Pro reads it: full-height tiles, a whole-number black level and an even crop origin. Files are slightly larger.")
+                    .padding(.top, 4)
+                CheckRow(label: "Downscale 2X", on: $o.downscale,
+                         hint: "Half the width and height, still raw (Bayer) CinemaDNG: raw proxies that relink to the originals in Resolve or Premiere. Output folders end in -half.")
+                CheckRow(label: "Copy non-DNG files (WAV, XMP…)", on: $o.copyOther)
+                CheckRow(label: "Generate checksums", on: $o.checksums,
+                         hint: "Writes checksum.sr in each output folder: a CRC-32C of every file written or copied (slimRAW's format), for checking copies and archives later.")
+                CheckRow(label: "Run a verification pass", on: Binding(get: { o.verify && o.checksums }, set: { o.verify = $0 }), disabled: !o.checksums,
+                         hint: o.checksums ? "After writing, decodes every tile again (lossless modes must match exactly), then reads every file back from the drive and checks it against its checksum."
+                                           : "Needs Generate checksums.")
+                    .padding(.leading, 18)
             }
         }
     }
@@ -2707,7 +2731,7 @@ struct OutputSidebar: View {
                 }.padding(.vertical, 2)
             }
             KV(k: "If it exists") { Seg(items: ExistingPolicy.allCases.map { ($0.rawValue, $0.label) }, value: $o.policy) }
-            if o.format == .cdng && o.nextToClip { Text("writes <clip>_\(o.dng.suffix) next to each clip folder").font(Th.f(10.5)).foregroundColor(Th.dim2) }
+            if o.format == .cdng && o.nextToClip { Text("writes <clip>_\(o.dng.suffix)\(o.downscale ? "-half" : "") next to each clip folder").font(Th.f(10.5)).foregroundColor(Th.dim2) }
         }
     }
     @ViewBuilder var warnings: some View {

@@ -35,7 +35,7 @@
 #include "braw_wb.h"
 #include "fsg2.h"
 
-#define VERSION "0.15"
+#define VERSION "0.16"
 
 static void die(const char *fmt, const char *a) { fprintf(stderr, "dng2braw: "); fprintf(stderr, fmt, a); fprintf(stderr, "\n"); exit(1); }
 static double now(void) { struct timeval t; gettimeofday(&t, NULL); return t.tv_sec + t.tv_usec * 1e-6; }
@@ -72,21 +72,50 @@ static char **list_dngs(char **inputs, int ninputs, int *nout) {
 /* generic colour: white balance as a correlated colour temperature from the DNG's own
    calibration (dng2prr's maths); tint 0. The Blackmagic sensor profile for the fp, and so
    real Blackmagic colour, comes from the Video Assist test clips (docs/TEST-PLAN). */
-/* Video Assist + fp: analog_gain = ISO/800 x 2^(1/3) exactly (1.259921 at 800, 5.039684 at 3200) */
+/* Video Assist + fp: analog_gain = ISO/800 x 2^(1/3) exactly (1.259921 at 800, 5.039684 at 3200).
+   Blackmagic's decoder accepts only some values in the frames' 'agpf' (FINDINGS 46): 2^(k/3) for k = 0..21 except
+   k = 3 (2.0), within about 1 %; anything else (all fp ISOs below 800, ISO 1000, 1250...) crashes it when the frame is
+   decoded. The value doesn't change the decoded picture, so it is put on the nearest accepted step (ISO stays exact). */
+static double braw_gain(int iso) {
+    double g = iso > 0 ? iso / 800.0 * cbrt(2.0) : 1.0;
+    int k = (int)lround(3 * log2(g));
+    if (k < 0) k = 0;
+    if (k > 21) k = 21;
+    if (k == 3) k = 3 * log2(g) < 3 ? 2 : 4;
+    return pow(2.0, k / 3.0);
+}
 static void frame_meta(const Frame *f, const Colour *c, int fps_n, int fps_d, BrawFrameMeta *fm) {
     memset(fm, 0, sizeof *fm);
     fm->fps_n = fps_n; fm->fps_d = fps_d;
     if (f->exposure_time > 0) { fm->shutter_angle = 360.0 * f->exposure_time * fps_n / fps_d; if (fm->shutter_angle > 360) fm->shutter_angle = 360; }
-    fm->iso = f->iso; fm->analog_gain = f->iso > 0 ? f->iso / 800.0 * cbrt(2.0) : 1.0;   /* Video Assist: ISO 800 -> 2^(1/3), 3200 -> 4 x 2^(1/3) */
+    fm->iso = f->iso; fm->analog_gain = braw_gain(f->iso);   /* Video Assist: ISO 800 -> 2^(1/3), 3200 -> 4 x 2^(1/3) */
     fm->kelvin = c->cct; fm->tint = 0; fm->fnumber = f->fnumber; fm->focal_mm = f->focal;
     int wk, wt;                       /* Blackmagic-style as-shot WB from the AsShotNeutral (FINDINGS 37); generic CCT otherwise */
     if (braw_wb_from_neutral(f->neutral, &wk, &wt) == 0) { fm->kelvin = wk; fm->tint = wt; }
 }
 
+/* Test hook (tests/braw_sizes.sh): DNG2BRAW_TEST_SIZE=WxH makes every frame W x H by cropping the DNG from its top
+   left, or repeating it (in whole Bayer pairs) when it is smaller, so any frame size can be put through Blackmagic's
+   decoder without a recording in that mode. The DNG's crop margins are kept. */
+static int load_frame_t(const char *path, Frame *f, int pixels) {
+    int rc = dngf_load_frame(path, f, pixels); const char *e = getenv("DNG2BRAW_TEST_SIZE"); int W, H;
+    if (!rc && getenv("DNG2BRAW_TEST_ISO")) f->iso = atoi(getenv("DNG2BRAW_TEST_ISO"));            /* metadata test switches */
+    if (!rc && getenv("DNG2BRAW_TEST_FNUM")) f->fnumber = atof(getenv("DNG2BRAW_TEST_FNUM"));
+    if (!rc && getenv("DNG2BRAW_TEST_FOCAL")) f->focal = atof(getenv("DNG2BRAW_TEST_FOCAL"));
+    int cl = -1, ct = -1;                                        /* WxH+L+T also sets the left and top crop margins */
+    if (rc || !e || sscanf(e, "%dx%d+%d+%d", &W, &H, &cl, &ct) < 2 || W < 32 || H < 32 || (W & 1) || (H & 1)) return rc;
+    if (cl >= 0 && ct >= 0) { f->crop[0] = cl; f->crop[2] = ct; }
+    if (pixels && f->raw) {
+        int pw = f->w & ~1, ph = f->h & ~1; uint16_t *n = malloc((size_t)W * H * 2);
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) n[(size_t)y * W + x] = f->raw[(size_t)(y % ph) * f->w + x % pw];
+        free(f->raw); f->raw = n;
+    }
+    f->w = W; f->h = H; return 0;
+}
 /* read-ahead: the next DNG is loaded on a thread while the current frame encodes */
 typedef struct { const char *path; Frame f; int rc; const BrawLayout *L; int prepare; } Prefetch;
 static void *prefetch_run(void *a) {      /* load the next DNG, then start its GPU stages (if any) */
-    Prefetch *p = a; p->rc = dngf_load_frame(p->path, &p->f, 1);
+    Prefetch *p = a; p->rc = load_frame_t(p->path, &p->f, 1);
     if (!p->rc && p->prepare) braw_prepare_frame(p->L, p->f.raw, p->f.black);
     return NULL;
 }
@@ -114,14 +143,15 @@ static void clip_meta(Meta *m, const Frame *f, const Colour *c, const BrawLayout
         char t[16]; if (fabs(g_desqueeze - nearbyint(g_desqueeze)) < 1e-6) snprintf(t, sizeof t, "%.1fx", g_desqueeze); else snprintf(t, sizeof t, "%.4gx", g_desqueeze);
         meta_u16(m, "anamorphic_enable", 1); meta_str(m, "anamorphic", t);
     }
-    meta_size(m, "crop_origin", f->crop[0], f->crop[2] + L->pad_top);
-    meta_size(m, "crop_size", L->w - f->crop[0] - f->crop[1], L->h - f->crop[2] - f->crop[3]);
+    int px, py, pw, ph; braw_picture(L, f->crop[0], f->crop[1], f->crop[2], f->crop[3], &px, &py, &pw, &ph);
+    meta_size(m, "crop_origin", L->org_x, L->org_y);            /* where the decoder starts the picture (FINDINGS 46) */
+    meta_size(m, "crop_size", pw, ph);
     meta_size(m, "safe_area", 0, 0);
     /* With gyro, the sensor area is the picture: telemetry-parser at d45ebf2 (the Gyroflow (fpSup) plugin v0.1.10)
        takes the readout as sensor_area_captured's rows x sensor_line_time, and later versions (19bc11f, Gyroflow 1.6.3)
        as the picture's rows x it; only equal rows give both the fp's real readout (cDNG Raw Convert FINDINGS 15). Without gyro, as the
        Video Assist reports the fp. */
-    if (g_line_time_us > 0) meta_size(m, "sensor_area_captured", L->w - f->crop[0] - f->crop[1], L->h - f->crop[2] - f->crop[3]);
+    if (g_line_time_us > 0) meta_size(m, "sensor_area_captured", pw, ph);
     else if (L->w == 3856 && L->h == 2170) meta_size(m, "sensor_area_captured", 6000, 3376);   /* fp UHD, as the Video Assist reports it */
     else meta_size(m, "sensor_area_captured", L->coded_w, L->coded_h);
     meta_str(m, "braw_compression_ratio", codec == BRAW_CODEC_BRAW ? rate_label() : codec == BRAW_CODEC_SPLICE ? "dng2braw splice test" : "uncompressed (dng2braw staging)");
@@ -133,7 +163,7 @@ static void clip_meta(Meta *m, const Frame *f, const Colour *c, const BrawLayout
     meta_str(m, "viewing_gamut", g_viewing_film ? "Blackmagic Design" : "Rec.709");
     meta_f32(m, "sensor_line_time", g_line_time_us);
     meta_str(m, "reel_name", clipname);
-    meta_f32(m, "analog_gain", f->iso > 0 ? f->iso / 800.0 * cbrt(2.0) : 1.0);
+    meta_f32(m, "analog_gain", braw_gain(f->iso));
     meta_u16(m, "analog_gain_is_constant", 1);
     /* the DNG's own colour, kept so later versions (and checks) can map it */
     const char *P = "io.github.fpsup.dng2braw.";
@@ -257,12 +287,13 @@ static void json_str(const char *k, const char *v, int comma) {
 static int probe_clip(const char *dir) {
     char *in[1] = { (char *)dir }; int nf = 0; char **files = list_dngs(in, 1, &nf);
     if (!nf) { printf("{\"error\":\"no DNG frames\"}\n"); return 1; }
-    Frame f; if (dngf_load_frame(files[0], &f, 0)) { printf("{\"error\":\"can't read the first DNG\"}\n"); return 1; }
+    Frame f; if (load_frame_t(files[0], &f, 0)) { printf("{\"error\":\"can't read the first DNG\"}\n"); return 1; }
     int fps_n = f.fps_n > 0 ? f.fps_n : 24, fps_d = f.fps_d > 0 ? f.fps_d : 1;
     braw_normalise_rate(&fps_n, &fps_d);
     Colour col = dngf_colour_params(&f); BrawFrameMeta fm; frame_meta(&f, &col, fps_n, fps_d, &fm);
     int pw = f.w - f.crop[0] - f.crop[1], ph = f.h - f.crop[2] - f.crop[3]; if (pw <= 0 || ph <= 0) { pw = f.w; ph = f.h; }
-    BrawLayout L; int braw_ok = !braw_layout(f.w, f.h, &L) && braw_size_tested(L.coded_w, L.coded_h);
+    BrawLayout L; int braw_ok = !braw_layout_crop(f.w, f.h, f.crop[0], f.crop[2], &L);
+    if (braw_ok) { int bx, by; braw_picture(&L, f.crop[0], f.crop[1], f.crop[2], f.crop[3], &bx, &by, &pw, &ph); }
     Fsg2Frame g; memset(&g, 0, sizeof g); char e[256] = ""; int gyro = fsg2_read(files[0], &g, e, sizeof e) == 0 && g.present;
     char wav[1024] = ""; { DIR *d = opendir(dir); struct dirent *de; char *best = NULL;
         while (d && (de = readdir(d))) if (de->d_name[0] != '.' && ends_with_ci(de->d_name, ".wav")) if (!best || strcmp(de->d_name, best) < 0) { free(best); best = strdup(de->d_name); }
@@ -340,12 +371,13 @@ int main(int argc, char **argv) {
     int nf; char **files = list_dngs(inputs, ninputs, &nf);
     if (limit > 0 && nf > limit) nf = limit;
     if (!nf) die("%s", "no DNG files");
-    Frame first; if (dngf_load_frame(files[0], &first, 0)) return 1;
+    Frame first; if (load_frame_t(files[0], &first, 0)) return 1;
     if (have_neutral) { first.neutral[0] = neutral[0]; first.neutral[1] = 1; first.neutral[2] = neutral[1]; }
     if (!fps_n) { fps_n = first.fps_n; fps_d = first.fps_d; }
     if (fps_n <= 0 || fps_d <= 0) { fps_n = 24; fps_d = 1; }
     braw_normalise_rate(&fps_n, &fps_d); braw_set_rate_denominator((uint32_t)fps_d);
-    BrawLayout L; if (braw_layout(first.w, first.h, &L)) { fprintf(stderr, "dng2braw: %dx%d: this recording mode isn't supported by the BRAW encoder yet (no slice layout for this size)\n", first.w, first.h); return 3; }
+    BrawLayout L; if (braw_layout_crop(first.w, first.h, first.crop[0], first.crop[2], &L)) { fprintf(stderr, "dng2braw: %dx%d: this recording mode isn't supported by the BRAW encoder yet (no slice layout for this size)\n", first.w, first.h); return 3; }
+    int PX, PY, PW, PH; braw_picture(&L, first.crop[0], first.crop[1], first.crop[2], first.crop[3], &PX, &PY, &PW, &PH);   /* the picture the decoder shows */
     Colour col = dngf_colour_params(&first);
     BrawFrameMeta fm0; frame_meta(&first, &col, fps_n, fps_d, &fm0);
     char clipname[256]; { const char *s = ninputs ? inputs[0] : files[0]; char t[4096]; snprintf(t, sizeof t, "%s", s);
@@ -353,7 +385,7 @@ int main(int argc, char **argv) {
         char *dot = strrchr(clipname, '.'); if (dot && !is_dir(s)) *dot = 0; }
 
     printf("%d frame(s), %dx%d, %d-bit, black %g, white %g, fps %d/%d\n", nf, first.w, first.h, first.bits, first.black, first.white, fps_n, fps_d);
-    printf("coded %dx%d (%d line(s) above the DNG); slices: %d strip(s) (", L.coded_w, L.coded_h, L.pad_top, L.ncols);
+    printf("coded %dx%d (image at +%d,+%d); picture %dx%d from DNG photosite (%d,%d); slices: %d strip(s) (", L.coded_w, L.coded_h, L.pad_left, L.pad_top, PW, PH, PX, PY, L.ncols);
     for (int i = 0; i < L.ncols; i++) printf("%s%d", i ? ", " : "", L.col_w[i]);
     printf(") x %d bands of %d lines, column-major\n", L.nrows, L.row_h);
     printf("white balance: %d K, tint %+d, ISO %d, shutter %.1f deg, F%.1f, %.0fmm\n", fm0.kelvin, fm0.tint, fm0.iso, fm0.shutter_angle, fm0.fnumber, fm0.focal_mm);
@@ -393,7 +425,7 @@ int main(int argc, char **argv) {
         else if (ngot == nf) {
             FILE *js = NULL; char jsp[4096] = "";
             if (gyro_jsonl && out) { snprintf(jsp, sizeof jsp, "%s", out); char *dot = strrchr(jsp, '.'), *sl = strrchr(jsp, '/'); if (dot && (!sl || dot > sl)) *dot = 0; strncat(jsp, ".jsonl", sizeof jsp - strlen(jsp) - 1); js = fopen(jsp, "w"); }
-            int pw = first.w - first.crop[0] - first.crop[1], ph = first.h - first.crop[2] - first.crop[3];   /* the decoded picture: DefaultCrop */
+            int pw = PW, ph = PH;   /* the decoded picture */
             if (pw <= 0 || ph <= 0) { pw = first.w; ph = first.h; }
             if (fsg2_messages(gf, nf, pw, ph, &gmsg, &glen, js, gerr, sizeof gerr) == 0) {
                 long ns = 0; for (int i = 0; i < nf; i++) ns += gf[i].n_samples;
@@ -425,7 +457,7 @@ int main(int argc, char **argv) {
                     m_g[j][0] = g[1] * d2r; m_g[j][1] = g[0] * d2r; m_g[j][2] = g[2] * d2r;
                     m_a[j][0] = -a[1]; m_a[j][1] = -a[0]; m_a[j][2] = -a[2];
                 }
-                int rows = (first.h - first.crop[2] - first.crop[3]) / 8 * 8; if (rows <= 0) rows = first.h / 8 * 8;
+                int rows = PH;
                 g_line_time_us = im.readout_us / rows;
                 printf("gyro: also as Blackmagic motion tracks (%u readings at %u Hz; readout %.3f ms)\n", m_n, m_rate, im.readout_us / 1000);
             } else fprintf(stderr, "dng2braw: warning: no Blackmagic motion tracks (%s)\n", e2);
@@ -440,9 +472,8 @@ int main(int argc, char **argv) {
         return 0;
     }
     braw_set_rate(g_rate_mode, g_rate_val);
-    if (codec == BRAW_CODEC_BRAW && !braw_size_tested(L.coded_w, L.coded_h) && !getenv("DNG2BRAW_ANY_SIZE")) {   /* fail before creating anything */
-        fprintf(stderr, "dng2braw: %dx%d: this recording mode isn't supported by the BRAW encoder yet\n", first.w, first.h); return 3;
-    }
+    if (codec == BRAW_CODEC_BRAW && !braw_size_tested(L.coded_w, L.coded_h))
+        printf("note: %dx%d isn't one of the frame sizes checked through Blackmagic's decoder; the layout follows the same rules\n", first.w, first.h);
 
     int tc_drop = 0, tc_nom = (int)nearbyint((double)fps_n / fps_d); long tc_start = 0; int have_tc = first.has_tc && tc_nom > 0;
     if (have_tc) tc_start = tc_frames(first.tc, tc_nom, &tc_drop);
@@ -533,7 +564,7 @@ int main(int argc, char **argv) {
     {
         size_t tr = astart(&b, "trak");
         o = astart(&b, "tkhd"); bu32(&b, 0xF); bu32(&b, 0); bu32(&b, 0); bu32(&b, 1); bu32(&b, 0); bu32(&b, mv_dur); bzero_(&b, 8);
-        bu16(&b, 0); bu16(&b, 0); bu16(&b, 0); bzero_(&b, 2); put_matrix(&b); put_fixed16(&b, L.w - first.crop[0] - first.crop[1]); put_fixed16(&b, L.h - first.crop[2] - first.crop[3]); aend(&b, o);
+        bu16(&b, 0); bu16(&b, 0); bu16(&b, 0); bzero_(&b, 2); put_matrix(&b); put_fixed16(&b, PW); put_fixed16(&b, PH); aend(&b, o);
         put_edts(&b, mv_dur);
         if (have_tc) { size_t tf = astart(&b, "tref"); size_t t2 = astart(&b, "tmcd"); bu32(&b, 2); aend(&b, t2); aend(&b, tf); }
         size_t md = astart(&b, "mdia");
@@ -543,7 +574,7 @@ int main(int argc, char **argv) {
         o = astart(&b, "vmhd"); bu32(&b, 1); bu16(&b, 0x40); bu16(&b, 0x8000); bu16(&b, 0x8000); bu16(&b, 0x8000); aend(&b, o);
         put_hdlr(&b, "dhlr", "alis", "Apple Alias Data Handler"); put_dinf(&b);
         size_t st = astart(&b, "stbl");
-        size_t sd = astart(&b, "stsd"); bu32(&b, 0); bu32(&b, 1); braw_put_sample_entry(&b, codec, L.w - first.crop[0] - first.crop[1], L.h - first.crop[2] - first.crop[3]); aend(&b, sd);
+        size_t sd = astart(&b, "stsd"); bu32(&b, 0); bu32(&b, 1); braw_put_sample_entry(&b, codec, PW, PH); aend(&b, sd);
         o = astart(&b, "stts"); bu32(&b, 0); bu32(&b, 1); bu32(&b, nf); bu32(&b, fps_d); aend(&b, o);
         put_stsc_ones(&b);
         o = astart(&b, "stsz"); bu32(&b, 0); bu32(&b, 0); bu32(&b, nf); for (int i = 0; i < nf; i++) bu32(&b, vsz[i]); aend(&b, o);
@@ -677,7 +708,7 @@ int main(int argc, char **argv) {
             buf = realloc(buf, vsz[i]); fseeko(fi, (off_t)voff[i], SEEK_SET);
             if (fread(buf, 1, vsz[i], fi) != vsz[i]) die("%s", "verify: short read");
             if (braw_stage_decode(buf, vsz[i], &L, back, err, sizeof err)) die("verify: %s", err);
-            Frame f; dngf_load_frame(files[i], &f, 1);
+            Frame f; load_frame_t(files[i], &f, 1);
             if (memcmp(f.raw, back, (size_t)f.w * f.h * 2)) { bad++; fprintf(stderr, "verify: frame %d differs\n", i); }
             dngf_free_frame(&f);
         }

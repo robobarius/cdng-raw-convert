@@ -9,7 +9,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 SRC="$ROOT/source"
 OUTDIR="$ROOT/macOS"
 APP="$OUTDIR/cDNG Raw Convert.app"
-VERSION=0.6.11
+VERSION=0.6.12
 BUILD="$(mktemp -d /tmp/dng2prr-build.XXXXXX)"
 
 fail() { echo; echo "BUILD FAILED: $1"; echo; if [ -t 0 ]; then read -n 1 -s -r -p "Press any key to close..."; fi; exit 1; }

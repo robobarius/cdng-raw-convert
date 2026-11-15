@@ -14,28 +14,55 @@
 #include "braw_metal.h"
 #endif
 
-/* FINDINGS 7: 5 strips, multiples of 16, remainder in the last (768 x4 + 784 at 3856); 72-line
-   slices, column-major; coded height = DNG height rounded up to 16 (2170 -> 2176). The strip
-   count for other widths (DCI, open gate) is a guess until those modes are recorded. */
-int braw_size_tested(int cw, int ch) {
-    static const int ok[][2] = { {3856, 2176},    /* fp UHD (Video Assist HDMI raw size) */
-                                 {3024, 2016} };  /* fp OG3K 3024 x 2010 (FINDINGS 40) */
-    for (size_t i = 0; i < sizeof ok / sizeof ok[0]; i++) if (ok[i][0] == cw && ok[i][1] == ch) return 1;
+/* FINDINGS 7: 5 strips, multiples of 16, remainder in the last (768 x4 + 784 at 3856); 72-line slices, column-major.
+   FINDINGS 46: the same rules hold at every size put through Blackmagic's decoder, from 272 x 160 to 8192 x 4336
+   coded (FHD, DCI 4K, UHD, 3K, OG3K, 6K open gate, 8K), with fewer strips below 1280 wide and taller bands above
+   32 bands. Outside that range the layout follows the same rules but hasn't been decoded. */
+int braw_size_tested(int cw, int ch) { return cw >= 256 && ch >= 144 && cw <= 8192 && ch <= 4352; }
+/* Lines or columns to add in front of the image so the picture starts where Blackmagic's decoder will take it from.
+   Measured through the SDK (FINDINGS 46): the decoder starts the picture at crop_origin rounded DOWN to a multiple
+   of 8, and never before 8. So the image is moved (by whole Bayer pairs, to keep the CFA phase) until its crop
+   margin lands on such a position; an odd margin can't, and ends one photosite off, as in a Video Assist recording. */
+static int snap8(int v) { v = v / 8 * 8; return v < 8 ? 8 : v; }
+static int pad_for(int margin) {
+    int best = 0, be = 1 << 30;
+    for (int p = 0; p <= 8; p += 2) {
+        int e = snap8(margin + p) - p - margin, ae = e < 0 ? -e : e;      /* photosites between the margin and the decoder's start */
+        if (ae < (be < 0 ? -be : be) || (ae == (be < 0 ? -be : be) && e > be)) { be = e; best = p; }
+    }
+    return best;
+}
+int braw_layout_crop(int w, int h, int crop_left, int crop_top, BrawLayout *L) {
+    memset(L, 0, sizeof *L);
+    if (w < 240 || h < 128 || (w & 1) || (h & 1) || w > 16368 || h > 16368 || crop_left < 0 || crop_top < 0) return -1;
+    /* coded size: both rounded up to 16 (blocks of 8, chroma 16 wide); the image sits at (pad_left, pad_top), the
+       rest is filled with its nearest photosites of the same colour */
+    L->w = w; L->h = h;
+    L->pad_left = pad_for(crop_left); L->pad_top = pad_for(crop_top);
+    if (getenv("DNG2BRAW_PAD_TOP")) L->pad_top = atoi(getenv("DNG2BRAW_PAD_TOP")) & ~1;      /* test switch */
+    L->org_x = snap8(crop_left + L->pad_left); L->org_y = snap8(crop_top + L->pad_top);
+    L->coded_w = (w + L->pad_left + 15) / 16 * 16; L->coded_h = (h + L->pad_top + 15) / 16 * 16;
+    L->ncols = BRAW_STRIPS;
+    while (L->ncols > 1 && L->coded_w / L->ncols < BRAW_MIN_STRIP) L->ncols--;     /* narrow frames: fewer strips (FINDINGS 46) */
+    int base = (L->coded_w / L->ncols) / 16 * 16, used = 0;
+    for (int i = 0; i < L->ncols - 1; i++) { L->col_w[i] = base; used += base; }
+    L->col_w[L->ncols - 1] = L->coded_w - used;
+    L->row_h = BRAW_SLICE_LINES; L->nrows = (L->coded_h + L->row_h - 1) / L->row_h;
+    if (L->nrows > BRAW_MAX_BANDS) {                           /* tall frames: taller bands, not more of them (FINDINGS 46) */
+        L->row_h = (L->coded_h + BRAW_MAX_BANDS * 8 - 1) / (BRAW_MAX_BANDS * 8) * 8; L->nrows = (L->coded_h + L->row_h - 1) / L->row_h;
+    }
+    if (0x80 + 4 * L->ncols * L->nrows > BRAW_HEADER_SIZE || L->ncols * L->nrows > BRAW_MAX_COLS * 64) return -1;
     return 0;
 }
-int braw_layout(int w, int h, BrawLayout *L) {
-    memset(L, 0, sizeof *L);
-    if (w <= 0 || h <= 0 || (w & 15)) return -1;
-    L->w = w; L->h = h; L->coded_w = w; L->coded_h = (h + 15) / 16 * 16;
-    L->pad_top = BRAW_PAD_TOP;
-    if (L->pad_top > L->coded_h - h) L->pad_top = (L->coded_h - h) / 2;
-    L->ncols = BRAW_STRIPS;
-    int base = (w / L->ncols) / 16 * 16, used = 0;
-    for (int i = 0; i < L->ncols - 1; i++) { L->col_w[i] = base; used += base; }
-    L->col_w[L->ncols - 1] = w - used;
-    L->row_h = BRAW_SLICE_LINES; L->nrows = (L->coded_h + L->row_h - 1) / L->row_h;
-    if (0x80 + 4 * L->ncols * L->nrows > BRAW_HEADER_SIZE) return -1;
-    return 0;
+int braw_layout(int w, int h, BrawLayout *L) { return braw_layout_crop(w, h, 8, 5, L); }   /* the fp's own margins */
+/* The picture the decoder shows: its first photosite in the DNG image, and its size (multiples of 8, inside the image). */
+void braw_picture(const BrawLayout *L, int crop_left, int crop_right, int crop_top, int crop_bottom, int *x, int *y, int *pw, int *ph) {
+    int x0 = L->org_x - L->pad_left, y0 = L->org_y - L->pad_top;
+    int w = L->w - crop_left - crop_right, h = L->h - crop_top - crop_bottom;
+    if (w <= 0 || h <= 0) { w = L->w - x0; h = L->h - y0; }
+    if (x0 + w > L->w) w = L->w - x0;
+    if (y0 + h > L->h) h = L->h - y0;
+    *x = x0; *y = y0; *pw = w / 8 * 8; *ph = h / 8 * 8;
 }
 
 /* ---- splice source (developer test) ----------------------------------------------------- */
@@ -54,9 +81,14 @@ static size_t sp_end(int k) {           /* end of slice k: next slice's offset, 
 /* ---- GPU pipeline (FINDINGS 35): frames are prepared (CFA -> coefficients) on the GPU ahead of the CPU coder --- */
 static int g_gpu_on = 1;
 void braw_set_gpu(int on) { g_gpu_on = on; }
-static void place_coded(const BrawLayout *L, const uint16_t *raw, uint16_t *coded) {   /* DNG rows at pad_top; same-phase padding */
-    int W = L->coded_w, H = L->coded_h;
-    for (int y = 0; y < H; y++) { int sy = y - L->pad_top; while (sy < 0) sy += 2; while (sy >= L->h) sy -= 2; memcpy(coded + (size_t)y * W, raw + (size_t)sy * L->w, (size_t)W * 2); }
+static void place_coded(const BrawLayout *L, const uint16_t *raw, uint16_t *coded) {   /* the DNG image at (pad_left, pad_top); same-phase padding */
+    int W = L->coded_w, H = L->coded_h, pl = L->pad_left;
+    for (int y = 0; y < H; y++) {
+        int sy = y - L->pad_top; while (sy < 0) sy += 2; while (sy >= L->h) sy -= 2;
+        uint16_t *r = coded + (size_t)y * W; memcpy(r + pl, raw + (size_t)sy * L->w, (size_t)L->w * 2);
+        for (int x = pl - 1; x >= 0; x--) r[x] = r[x + 2];                      /* padding: the nearest Bayer pair again */
+        for (int x = pl + L->w; x < W; x++) r[x] = r[x - 2];
+    }
 }
 #ifdef BRAW_METAL
 static BrawGpu *g_gpu; static int g_gpu_state; static int g_next_slot, g_fifo[8], g_fh, g_ft;
@@ -307,7 +339,7 @@ int braw_stage_decode(const uint8_t *f, size_t len, const BrawLayout *L, uint16_
         for (int y = 0; y < h; y++, s += 2 * (size_t)w) {
             int dy = y0 + y - L->pad_top;
             if (dy < 0 || dy >= L->h) continue;                /* padding lines */
-            for (int x = 0; x < w; x++) raw[(size_t)dy * L->w + x0 + x] = be16(s + 2 * x);
+            for (int x = 0; x < w; x++) { int dx = x0 + x - L->pad_left; if (dx >= 0 && dx < L->w) raw[(size_t)dy * L->w + dx] = be16(s + 2 * x); }
         }
     }
     return 0;

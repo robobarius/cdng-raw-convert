@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.12 (2026-11-15): slimRAW-style DNG options; Blackmagic RAW at every frame size and ISO
+
+**CinemaDNG output: four new options, as in slimRAW** (Output panel → Compression):
+- **Adobe Premiere CC compatibility** (Lossless and Lossless 10-bit log): the layout slimRAW uses for Premiere Pro. Tiles a whole image high and as wide as a divisor of the image width, a whole-number black level (256 instead of the fp's 255.99, which slimRAW's notes link to flicker in Premiere) and an even crop origin. The photosites are unchanged. Premiere doesn't read lossy CinemaDNG, so the option is off for the lossy modes.
+- **Downscale 2X:** half the width and height, still raw (Bayer) CinemaDNG, for raw proxies that relink to the originals. The output folder ends in `-half`. The filter and the tags match slimRAW's output exactly: the photosites are bit-identical to slimRAW 1.10's on the same frames.
+- **Generate checksums:** a `checksum.sr` in each output folder, in slimRAW's format: the CRC-32C of every DNG and copied file. slimRAW can check it, and so can any CRC-32C tool.
+- **Run a verification pass** (needs Generate checksums): after writing, every tile is decoded again (lossless must match exactly), then every file is read back from the drive, not from the system's file cache, and checked against its checksum.
+- Command line: `dng2prr --cdng … --premiere --downscale --checksums --verify-pass`. A verification failure exits with code 4.
+- FINDINGS 16 records what slimRAW's options do to the files, measured from its output.
+
+**Blackmagic RAW (beta) for every fp recording mode** (dng2braw 0.16):
+- FHD, DCI 4K, UHD, 3K (3032 wide), the open-gate modes and fpSup custom sizes such as 3840×2560 are now converted instead of skipped as "mode not supported yet". The frame is padded to multiples of 16, the picture placed where Blackmagic's decoder starts it, and tall frames use taller bands of slices (the decoder crashes with more than 32). Checked through Blackmagic's decoder at 30 frame sizes from 258×146 to 8192×4320 (FINDINGS 46).
+- **Fix: clips shot below ISO 800, or at ISO 1000, 1250, 2000, 2500 and so on, made .braw files that Blackmagic's software couldn't open:** its decoder crashed on the frames' analog-gain value. It accepts only certain steps, and the decoded picture doesn't depend on them, so the gain is now written on the nearest accepted step. The ISO stays exact. **Convert again** any such clips made with 0.6.11 or earlier.
+
 ## 0.6.11 (2026-11-04): Blackmagic RAW marked beta; gyro readout fix
 
 - The Output panel marks **Blackmagic RAW** as **BETA** while gyro stabilisation through it is being validated.
