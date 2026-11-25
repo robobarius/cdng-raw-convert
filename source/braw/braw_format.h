@@ -29,6 +29,8 @@ int braw_set_splice(const uint8_t *payload, size_t len, char *err, size_t errlen
 #define BRAW_FRAME_ALIGN 256          /* Video Assist frames are multiples of 256 bytes */
 #define BRAW_HEADER_SIZE 4608         /* first slice offset (0x1200), all recorders seen */
 #define BRAW_STRIPS 5                 /* Video Assist + fp: 5 strips (768 x4 + 784 at 3856 wide) */
+#define BRAW_MIN_STRIP 256             /* narrowest strip written; narrower frames get fewer strips */
+#define BRAW_MAX_BANDS 32             /* bands per frame: 31 on the Video Assist, 32 in camera files; 34 crashes the decoder */
 #define BRAW_SLICE_LINES 72           /* frame header 0x10: slice height in lines */
 #define BRAW_PAD_TOP 2                /* coded row = DNG row + 2 (FINDINGS 23: DNG-derived planes processed by the
                                          SDK line up with the Video Assist decode, and only an even shift keeps
@@ -38,11 +40,14 @@ int braw_set_splice(const uint8_t *payload, size_t len, char *err, size_t errlen
 typedef struct {
     int w, h;                         /* DNG image size */
     int coded_w, coded_h;             /* coded frame size (3856 x 2176 for fp UHD) */
-    int pad_top;                      /* lines added above the DNG image */
+    int pad_top, pad_left;            /* lines added above the DNG image, columns added on its left */
+    int org_x, org_y;                 /* where the decoder starts the picture, in the coded frame (multiples of 8) */
     int ncols, col_w[BRAW_MAX_COLS];
     int nrows, row_h;                 /* bands of row_h lines; the last one is shorter */
 } BrawLayout;
-int braw_layout(int w, int h, BrawLayout *L);
+int braw_layout(int w, int h, BrawLayout *L);                 /* with the fp's usual crop margins (8, 5) */
+int braw_layout_crop(int w, int h, int crop_left, int crop_top, BrawLayout *L);
+void braw_picture(const BrawLayout *L, int crop_left, int crop_right, int crop_top, int crop_bottom, int *x, int *y, int *pw, int *ph);
 /* coded sizes whose BRAW output has been checked through Blackmagic's decoder (FINDINGS 40) */
 int braw_size_tested(int coded_w, int coded_h);
 /* anamorphic: a 'pasp' box (horizontal:vertical pixel spacing) in the sample entry; 1:1 writes none */

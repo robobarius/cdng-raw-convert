@@ -27,9 +27,16 @@
 #include "fsg2.h"   /* GPL-3.0-or-later: build with -DNO_GYRO and without fsg2.c for an LGPL-only binary */
 #endif
 #include <unistd.h>
+#include <fcntl.h>
+#ifdef __APPLE__
+#include <sys/mman.h>
+#endif
 #include <pthread.h>
+#if defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#endif
 
-#define VERSION "0.6.10"
+#define VERSION "0.6.12"
 
 int prr_encode_tiles(const uint16_t *img, int stride, int w, int h, int align, int scale,
                      const uint8_t *qmat, uint8_t *out, size_t cap,
@@ -581,6 +588,11 @@ static void usage(void) {
         "         --gyro-jsonl: also write OUT.jsonl). --no-extra: no timecode, metadata or gyro tracks.\n"
         "       dng2prr --cdng OUTDIR CLIP_FOLDER [--cdng-mode lossless|log10|vbr-hq|vbr-lt|3|4|5|7]\n"
         "               [--copy-other] [--verify] [--skip-existing] [--jobs N]   (compressed CinemaDNG)\n"
+        "               [--downscale] [--premiere] [--checksums] [--verify-pass]\n"
+        "         --verify: decode every tile again and compare (lossless: exactly). --downscale: half the width and height\n"
+        "         (raw proxies). --premiere: a layout Adobe Premiere Pro reads (lossless modes). --checksums: CRC-32C of every\n"
+        "         output file in OUTDIR/checksum.sr (slimRAW's format). --verify-pass: then read them all back from the\n"
+        "         drive and check them (exit code 4 on a checksum error).\n"
         "       dng2prr --extract-meta IN.mov OUTDIR   (each frame's DNG tags, as carried in the .mov)\n"
         "       dng2prr --list-clips PATH...\n", VERSION);
     exit(2);
@@ -681,6 +693,132 @@ static size_t ifd_write(const Ifd *f, uint8_t *buf, size_t pos, int le) {
     return vpos;
 }
 
+/* ---- CRC-32C (Castagnoli), as slimRAW's checksum.sr lists use (one "CRC<tab>name" line per file) ---- */
+static uint32_t crc_tab[8][256]; static pthread_once_t crc_once = PTHREAD_ONCE_INIT;
+static void crc_init(void) {
+    for (int i = 0; i < 256; i++) { uint32_t c = i; for (int k = 0; k < 8; k++) c = c & 1 ? (c >> 1) ^ 0x82F63B78u : c >> 1; crc_tab[0][i] = c; }
+    for (int i = 0; i < 256; i++) for (int t = 1; t < 8; t++) crc_tab[t][i] = (crc_tab[t - 1][i] >> 8) ^ crc_tab[0][crc_tab[t - 1][i] & 255];
+}
+/* running CRC: start with crc = 0, feed the bytes in order */
+static uint32_t crc32c(uint32_t crc, const uint8_t *p, size_t n) {
+    crc = ~crc;
+#if defined(__ARM_FEATURE_CRC32)
+    while (n && ((uintptr_t)p & 7)) { crc = __crc32cb(crc, *p++); n--; }
+    for (; n >= 8; n -= 8, p += 8) { uint64_t v; memcpy(&v, p, 8); crc = __crc32cd(crc, v); }
+    while (n--) crc = __crc32cb(crc, *p++);
+#else
+    pthread_once(&crc_once, crc_init);
+    for (; n >= 8; n -= 8, p += 8) {
+        uint32_t a = crc ^ (p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24), b = p[4] | p[5] << 8 | p[6] << 16 | (uint32_t)p[7] << 24;
+        crc = crc_tab[7][a & 255] ^ crc_tab[6][(a >> 8) & 255] ^ crc_tab[5][(a >> 16) & 255] ^ crc_tab[4][a >> 24] ^
+              crc_tab[3][b & 255] ^ crc_tab[2][(b >> 8) & 255] ^ crc_tab[1][(b >> 16) & 255] ^ crc_tab[0][b >> 24];
+    }
+    while (n--) crc = crc_tab[0][(crc ^ *p++) & 255] ^ (crc >> 8);
+#endif
+    return ~crc;
+}
+/* CRC-32C of a file. nocache: read it from the drive, not from the system's file cache (the verification pass) */
+static int crc32c_file(const char *path, int nocache, uint32_t *out) {
+    int fd = open(path, O_RDONLY); if (fd < 0) return -1;
+#if defined(F_NOCACHE)
+    if (nocache) {        /* F_NOCACHE alone still reads pages already cached (just written): invalidate them first */
+        struct stat st;
+        if (!fstat(fd, &st) && st.st_size > 0) {
+            void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+            if (m != MAP_FAILED) { msync(m, (size_t)st.st_size, MS_SYNC | MS_INVALIDATE); munmap(m, (size_t)st.st_size); }
+        }
+        fcntl(fd, F_NOCACHE, 1);
+    }
+#elif defined(POSIX_FADV_DONTNEED)
+    if (nocache) { fdatasync(fd); posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); }
+#endif
+    (void)nocache;
+    size_t cap = 1 << 22; uint8_t *b = malloc(cap); uint32_t c = 0; ssize_t n; int rc = 0;
+    while ((n = read(fd, b, cap)) > 0) c = crc32c(c, b, (size_t)n);
+    if (n < 0) rc = -1;
+    free(b); close(fd); *out = c; return rc;
+}
+
+/* ---- Downscale 2X: a half-size CFA image with the same colour pattern (raw proxies) ----
+   Each output photosite is its colour's value at the centre of the 2 x 2 source photosites it replaces,
+   interpolated from the four nearest source photosites of that colour inside its 4 x 4 block: for a colour that
+   appears once in the 2 x 2 pattern, bilinearly (weights 9, 3, 3, 1 / 16); for a colour that appears twice (green),
+   on its diagonal lattice (3, 3, 1, 1 / 8). Rounded to nearest. Past the bottom or right edge the nearest photosite
+   of the same colour is used. This is the filter slimRAW 1.10 uses (its output matches bit for bit, FINDINGS 16). */
+static uint16_t *bayer_half(const uint16_t *s, int w, int h, const uint8_t cfa[4], int ow, int oh) {
+    struct { int n, dy[4], dx[4], wt[4], sh; } tp[4];
+    for (int q = 0; q < 4; q++) {
+        int py = q >> 1, px = q & 1, c = cfa[q], cnt = 0, CY = 4 * py + 1, CX = 4 * px + 1;   /* centre, in half-photosites */
+        for (int k = 0; k < 4; k++) cnt += cfa[k] == c;
+        tp[q].n = 0; tp[q].sh = cnt == 1 ? 4 : 3;
+        if (cnt > 2) return NULL;
+        for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) {
+            if (cfa[(y & 1) * 2 + (x & 1)] != c) continue;
+            int dy = abs(2 * y - CY), dx = abs(2 * x - CX), wt = 0;
+            if (cnt == 1) { if (dy <= 3 && dx <= 3) wt = (dy == 1 ? 3 : 1) * (dx == 1 ? 3 : 1); }
+            else if (dy == 1 && dx == 1) wt = 3;
+            else if ((dy == 1 && dx == 3) || (dy == 3 && dx == 1)) wt = 1;
+            if (wt && tp[q].n < 4) { int i = tp[q].n++; tp[q].dy[i] = y; tp[q].dx[i] = x; tp[q].wt[i] = wt; }
+        }
+        if (tp[q].n != 4) return NULL;
+    }
+    uint16_t *o = malloc(2 * (size_t)ow * oh); if (!o) return NULL;
+    for (int Y = 0; Y < oh; Y++) for (int X = 0; X < ow; X++) {
+        int q = (Y & 1) * 2 + (X & 1), by = (Y >> 1) * 4, bx = (X >> 1) * 4; uint32_t sum = 0;
+        for (int i = 0; i < 4; i++) {
+            int sy = by + tp[q].dy[i], sx = bx + tp[q].dx[i];
+            while (sy >= h) sy -= 2;
+            while (sx >= w) sx -= 2;
+            sum += (uint32_t)tp[q].wt[i] * s[(size_t)sy * w + sx];
+        }
+        o[(size_t)Y * ow + X] = (uint16_t)((sum + (1u << (tp[q].sh - 1))) >> tp[q].sh);
+    }
+    return o;
+}
+/* numeric tag values (SHORT, LONG, RATIONAL, SRATIONAL, SLONG) */
+static double ent_get(const Entry *e, uint32_t i, int le) {
+    if (i >= e->count) return 0;
+    switch (e->type) {
+    case 3: return rd16(e->val + 2 * i, le);
+    case 4: return rd32(e->val + 4 * i, le);
+    case 9: return (int32_t)rd32(e->val + 4 * i, le);
+    case 5: { uint32_t d = rd32(e->val + 8 * i + 4, le); return d ? (double)rd32(e->val + 8 * i, le) / d : 0; }
+    case 10: { int32_t d = (int32_t)rd32(e->val + 8 * i + 4, le); return d ? (double)(int32_t)rd32(e->val + 8 * i, le) / d : 0; }
+    }
+    return 0;
+}
+static void ent_set(Entry *e, uint32_t i, uint32_t v, int le) {
+    if (i >= e->count) return;
+    switch (e->type) {
+    case 3: wr16(e->val + 2 * i, v, le); break;
+    case 4: case 9: wr32(e->val + 4 * i, v, le); break;
+    case 5: case 10: wr32(e->val + 8 * i, v, le); wr32(e->val + 8 * i + 4, 1, le); break;
+    }
+}
+/* opcodes that work on a rectangle of the image (TrimBounds, MapTable, MapPolynomial, GainMap, Delta/ScalePer...):
+   their Top, Left, Bottom, Right, in photosites, halved for the downscaled image. Others use relative coordinates. */
+static void opcodes_half(Entry *e) {
+    uint8_t *b = e->val; size_t n = e->len; if (n < 4) return;
+    uint32_t cnt = rd32(b, 0); size_t p = 4;
+    for (uint32_t k = 0; k < cnt && p + 16 <= n; k++) {
+        uint32_t id = rd32(b + p, 0), sz = rd32(b + p + 12, 0);
+        if (p + 16 + (size_t)sz > n) return;
+        if (id >= 6 && id <= 13 && sz >= 16) {
+            uint8_t *a = b + p + 16;
+            for (int i = 0; i < 4; i++) { uint32_t v = rd32(a + 4 * i, 0); wr32(a + 4 * i, i < 2 ? v / 2 : (v + 1) / 2, 0); }
+        }
+        p += 16 + sz;
+    }
+}
+/* Premiere CC compatibility: tiles a whole column of the image high, and as wide as a divisor of the image width
+   (no partly filled tiles): the largest even one up to 256 (252 at 3024 and 1512, as slimRAW chooses), or if that's
+   narrower than 128, the smallest above 256 (758 at 3032) (FINDINGS 16) */
+static int premiere_tile_width(int w) {
+    for (int t = 256; t >= 128; t -= 2) if (w % t == 0) return t;
+    for (int t = 258; t <= 2048 && t <= w; t += 2) if (w % t == 0) return t;
+    return 256;
+}
+
 enum { M_LOSSLESS, M_LOG10, M_LOSSY };
 static double LOSSY_TOE = 0.1;           /* toe of the lossy curve (see make_curve) */
 static int TW = 256, TH = 256;          /* DNG tile size (DNG2PRR_TILE=WxH to override, for tests) */
@@ -744,17 +882,22 @@ static void make_inverse(const uint16_t *tab, int N, uint16_t *inv /* 65536 */) 
 
 typedef struct {
     char **files; int nfiles; const char *outdir; CdngMode mode; int verify, skip_existing;
+    int downscale, premiere, checksums, tw, th; uint32_t *crc; char *have_crc;   /* crc: CRC-32C of each frame's output file */
     int next, done, failed, skipped; long long in_bytes, out_bytes; double max_err_sum; int err_frames;
     pthread_mutex_t mu;
 } CJob;
 
 
-static int cdng_one(CJob *j, const char *path, long long *in_b, long long *out_b) {
+static int cdng_one(CJob *j, int idx, const char *path, long long *in_b, long long *out_b) {
+    int TW = j->tw, TH = j->th;            /* this clip's tile size (run_cdng) */
     const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
     char outp[4096], tmpp[4096];
     snprintf(outp, sizeof outp, "%s/%s", j->outdir, base);
     snprintf(tmpp, sizeof tmpp, "%s/.%s.partial", j->outdir, base);
-    if (j->skip_existing && is_file(outp)) return 1;
+    if (j->skip_existing && is_file(outp)) {
+        if (j->checksums && crc32c_file(outp, 0, &j->crc[idx]) == 0) j->have_crc[idx] = 1;
+        return 1;
+    }
     FILE *fh = fopen(path, "rb"); if (!fh) { fprintf(stderr, "dng2prr: can't read %s\n", path); return -1; }
     fseeko(fh, 0, SEEK_END); size_t dlen = (size_t)ftello(fh); fseeko(fh, 0, SEEK_SET);
     uint8_t *d = malloc(dlen); if (fread(d, 1, dlen, fh) != dlen) { fclose(fh); free(d); return -1; } fclose(fh);
@@ -763,6 +906,26 @@ static int cdng_one(CJob *j, const char *path, long long *in_b, long long *out_b
     Frame f; if (load_frame(path, &f, 2)) { free(d); return -1; }
     Ifd ifd = {0}; if (parse_ifd(d, dlen, rd32(d + 4, le), le, &ifd, 0)) { fprintf(stderr, "dng2prr: %s: can't parse IFD\n", path); free(d); free(f.raw); return -1; }
 
+    int src_w = f.w, src_h = f.h;
+    if (j->downscale) {
+        uint8_t cfa[4] = {0, 1, 1, 2};
+        for (int i = 0; i < ifd.n; i++) if (ifd.e[i].tag == 33422 && ifd.e[i].len == 4) memcpy(cfa, ifd.e[i].val, 4);
+        if (f.lin) {                                /* filter linear values: apply the LinearizationTable first */
+            for (size_t i = 0; i < (size_t)f.w * f.h; i++) { uint32_t v = f.raw[i]; f.raw[i] = f.lin[v < (uint32_t)f.nlin ? v : (uint32_t)f.nlin - 1]; }
+            free(f.lin); f.lin = NULL; f.nlin = 0;
+            int b = 1; while (b < 16 && (1 << b) <= f.white) b++;
+            if (b > f.bits) f.bits = b;
+        }
+        int ow = (f.w + 1) / 2, oh = (f.h + 1) / 2;
+        if (j->premiere && (oh & 1)) oh++;          /* even height for Premiere */
+        uint16_t *half = bayer_half(f.raw, f.w, f.h, cfa, ow, oh);
+        if (!half) { fprintf(stderr, "dng2prr: %s: Downscale 2X needs a 2 x 2 colour filter pattern\n", path); free(d); free(f.raw); free_ifd(&ifd); return -1; }
+        free(f.raw); f.raw = half; f.w = ow; f.h = oh;
+    } else if (j->premiere && (f.h & 1) && f.h > 2) {   /* even height for Premiere: one more line, of the same colours */
+        uint16_t *r = realloc(f.raw, 2 * (size_t)f.w * (f.h + 1)); if (!r) { free(d); free(f.raw); free_ifd(&ifd); return -1; }
+        f.raw = r; memcpy(r + (size_t)f.h * f.w, r + (size_t)(f.h - 2) * f.w, 2 * (size_t)f.w); f.h++;
+    }
+    if (TH <= 0) TH = f.h;                          /* Premiere: tiles as high as the image */
     int w = f.w, h = f.h, across = (w + TW - 1) / TW, down = (h + TH - 1) / TH, nt = across * down;
     /* code values to store, the JPEG precision and the new linearization table */
     int bits = f.bits, N = 0; uint16_t *tab = NULL;
@@ -888,6 +1051,28 @@ static int cdng_one(CJob *j, const char *path, long long *in_b, long long *out_b
             tg == 259 || tg == 258 || tg == 50712 || tg == 50972 || tg == 51111) { free(ifd.e[i].val); if (ifd.e[i].sub) { free_ifd(ifd.e[i].sub); free(ifd.e[i].sub); } continue; }
         out.e[out.n++] = ifd.e[i];
     }
+    for (int i = 0; i < out.n; i++) {                /* tags that describe the image's size and position */
+        Entry *e = &out.e[i];
+        if (e->tag == 256 && w != src_w) ent_set(e, 0, (uint32_t)w, le);
+        if (e->tag == 257 && h != src_h) ent_set(e, 0, (uint32_t)h, le);
+        if (j->downscale) {
+            if (e->tag == 50719 || e->tag == 50720) for (uint32_t k = 0; k < e->count && k < 2; k++) ent_set(e, k, (uint32_t)(ent_get(e, k, le) / 2), le);
+            if (e->tag == 50829 && e->count == 4) for (uint32_t k = 0; k < 4; k++) { double v = ent_get(e, k, le); ent_set(e, k, (uint32_t)(k < 2 ? v / 2 : (v + 1) / 2), le); }
+            if (e->tag == 50830) for (uint32_t k = 0; k < e->count; k++) { double v = ent_get(e, k, le); ent_set(e, k, (uint32_t)((k & 3) < 2 ? v / 2 : (v + 1) / 2), le); }
+            if (e->tag == 51008 || e->tag == 51009 || e->tag == 51022) opcodes_half(e);
+        }
+        if (j->premiere) {
+            if (e->tag == 50719) for (uint32_t k = 0; k < e->count && k < 2; k++) { uint32_t v = (uint32_t)ent_get(e, k, le); if (v & 1) ent_set(e, k, v - 1, le); }   /* even crop origin: keeps the CFA phase */
+            if (e->tag == 50714 && (e->type == 5 || e->type == 10)) {      /* whole-number black level */
+                uint32_t *bv = malloc(4 * (size_t)e->count);
+                for (uint32_t k = 0; k < e->count; k++) { double v = ent_get(e, k, le); bv[k] = v > 0 ? (uint32_t)lround(v) : 0; }
+                Entry ne = mk_entry(50714, 4, e->count, bv, le); free(bv); free(e->val); *e = ne;
+            }
+        }
+    }
+    if (j->downscale) {                               /* per-column/row black deltas don't survive halving */
+        int k = 0; for (int i = 0; i < out.n; i++) { if (out.e[i].tag == 50715 || out.e[i].tag == 50716) { free(out.e[i].val); continue; } out.e[k++] = out.e[i]; } out.n = k;
+    }
     uint32_t v1;
     v1 = (tab && getenv("DNG2PRR_BPS16")) ? 16 : bits;            /* BitsPerSample (test switch) */
     out.e[out.n++] = mk_entry(258, 3, 1, &v1, le);
@@ -916,6 +1101,7 @@ static int cdng_one(CJob *j, const char *path, long long *in_b, long long *out_b
         FILE *fo = fopen(tmpp, "wb");
         if (!fo || fwrite(buf, 1, total, fo) != total || fclose(fo)) { fprintf(stderr, "dng2prr: can't write %s\n", tmpp); rc = -1; unlink(tmpp); }
         else if (rename(tmpp, outp)) { fprintf(stderr, "dng2prr: can't rename to %s\n", outp); rc = -1; unlink(tmpp); }
+        else if (j->checksums) { j->crc[idx] = crc32c(0, buf, total); j->have_crc[idx] = 1; }
     } else rc = -1;
     *out_b = (long long)total;
     if (j->verify && j->mode.kind == M_LOSSY) { pthread_mutex_lock(&j->mu); j->max_err_sum += maxerr; j->err_frames++; pthread_mutex_unlock(&j->mu); }
@@ -937,7 +1123,7 @@ static void *cdng_worker(void *arg) {
         int i = j->next++;
         pthread_mutex_unlock(&j->mu);
         long long ib = 0, ob = 0;
-        int rc = cdng_one(j, j->files[i], &ib, &ob);
+        int rc = cdng_one(j, i, j->files[i], &ib, &ob);
         pthread_mutex_lock(&j->mu);
         if (rc < 0) j->failed = 1;
         else if (rc == 1) j->skipped++;
@@ -948,12 +1134,14 @@ static void *cdng_worker(void *arg) {
     }
 }
 
-static int copy_file(const char *src, const char *dst) {
+static int copy_file(const char *src, const char *dst, uint32_t *crc) {
     FILE *a = fopen(src, "rb"); if (!a) return -1;
     char tmp[4096]; snprintf(tmp, sizeof tmp, "%s.partial", dst);
     FILE *b = fopen(tmp, "wb"); if (!b) { fclose(a); return -1; }
     char buf[1 << 16]; size_t n; int rc = 0;
-    while ((n = fread(buf, 1, sizeof buf, a)) > 0) if (fwrite(buf, 1, n, b) != n) { rc = -1; break; }
+    uint32_t c = 0;
+    while ((n = fread(buf, 1, sizeof buf, a)) > 0) { c = crc32c(c, (uint8_t *)buf, n); if (fwrite(buf, 1, n, b) != n) { rc = -1; break; } }
+    if (crc) *crc = c;
     fclose(a); if (fclose(b)) rc = -1;
     if (rc || rename(tmp, dst)) { unlink(tmp); return -1; }
     return 0;
@@ -965,8 +1153,11 @@ static int mkdirs(const char *p) {
     return mkdir(t, 0755) && !is_dir(t) ? -1 : 0;
 }
 
+typedef struct { char *name; uint32_t crc; } CrcItem;
+static int cmp_crc(const void *a, const void *b) { return strcmp(((const CrcItem *)a)->name, ((const CrcItem *)b)->name); }
+
 static int run_cdng(const char *outdir, const char *mode_s, char **inputs, int ninputs, int jobs,
-                    int copy_other, int verify, int skip_existing) {
+                    int copy_other, int verify, int skip_existing, int downscale, int premiere, int checksums, int verify_pass) {
     CdngMode mode; if (parse_cdng_mode(mode_s, &mode)) die("unknown --cdng-mode %s (lossless, log10, vbr-hq, vbr-lt, 3, 4, 5, 7)", mode_s);
     if (ninputs != 1 || !is_dir(inputs[0])) die("%s", "--cdng needs exactly one clip folder");
     if (mkdirs(outdir)) die("can't create %s", outdir);
@@ -982,16 +1173,31 @@ static int run_cdng(const char *outdir, const char *mode_s, char **inputs, int n
     if (dir) closedir(dir);
     if (!nf) die("%s", "no DNG files");
     qsort(files, nf, sizeof(char *), cmpstr);
-    printf("%d frame(s), CinemaDNG %s\n", nf, mode.name); fflush(stdout);
+    if (premiere && mode.kind == M_LOSSY) { printf("note: Premiere Pro reads only lossless CinemaDNG; the Premiere option is left off for %s\n", mode.name); premiere = 0; }
+    if (verify_pass && !checksums) checksums = 1;
+    printf("%d frame(s), CinemaDNG %s%s%s%s\n", nf, mode.name, downscale ? ", downscaled 2X" : "", premiere ? ", Premiere Pro compatible" : "",
+           checksums ? ", checksums" : ""); fflush(stdout);
+    CrcItem *ci = calloc((size_t)(nf + no) + 1, sizeof(CrcItem)); int nci = 0;
     if (copy_other)
         for (int i = 0; i < no; i++) {
             const char *b = strrchr(other[i], '/') + 1; char dst[4096]; snprintf(dst, sizeof dst, "%s/%s", outdir, b);
-            if (skip_existing && is_file(dst)) continue;
-            if (copy_file(other[i], dst)) fprintf(stderr, "dng2prr: warning: could not copy %s\n", b);
-            else printf("copied %s\n", b);
+            if (!strcmp(b, "checksum.sr")) continue;                 /* the source's own list describes the source */
+            uint32_t c = 0;
+            if (skip_existing && is_file(dst)) { if (checksums && !crc32c_file(dst, 0, &c)) { ci[nci].name = strdup(b); ci[nci++].crc = c; } continue; }
+            if (copy_file(other[i], dst, &c)) fprintf(stderr, "dng2prr: warning: could not copy %s\n", b);
+            else { printf("copied %s\n", b); if (checksums) { ci[nci].name = strdup(b); ci[nci++].crc = c; } }
         }
     CJob j; memset(&j, 0, sizeof j);
     j.files = files; j.nfiles = nf; j.outdir = outdir; j.mode = mode; j.verify = verify; j.skip_existing = skip_existing;
+    j.downscale = downscale; j.premiere = premiere; j.checksums = checksums;
+    j.crc = calloc(nf, 4); j.have_crc = calloc(nf, 1);
+    j.tw = TW; j.th = TH;
+    if (premiere) {                              /* Premiere: tiles a column of the image wide and the whole image high */
+        Frame f0; int fw = 0;
+        if (!load_frame(files[0], &f0, 0)) { fw = downscale ? (f0.w + 1) / 2 : f0.w; free(f0.raw); free(f0.lin); }
+        j.tw = fw ? premiere_tile_width(fw) : 256; j.th = 0;
+        if (getenv("DNG2PRR_TILE")) { j.tw = TW; j.th = TH; }
+    }
     pthread_mutex_init(&j.mu, NULL);
     double t0 = now();
     pthread_t *th = malloc(sizeof(pthread_t) * jobs);
@@ -999,11 +1205,33 @@ static int run_cdng(const char *outdir, const char *mode_s, char **inputs, int n
     for (int i = 0; i < jobs; i++) pthread_join(th[i], NULL);
     if (j.failed) die("%s", "a frame failed; stopping (frames already written are complete files)");
     double el = now() - t0;
+    int vbad = 0;
+    if (checksums) {                             /* checksum.sr: one "CRC-32C<tab>file name" line per file, as slimRAW writes */
+        for (int i = 0; i < nf; i++) if (j.have_crc[i]) { const char *b = strrchr(files[i], '/'); ci[nci].name = strdup(b ? b + 1 : files[i]); ci[nci++].crc = j.crc[i]; }
+        qsort(ci, nci, sizeof(CrcItem), cmp_crc);
+        char cp[4096], tp[4096]; snprintf(cp, sizeof cp, "%s/checksum.sr", outdir); snprintf(tp, sizeof tp, "%s/.checksum.sr.partial", outdir);
+        FILE *fc = fopen(tp, "wb"); int ok = fc != NULL;
+        for (int i = 0; ok && i < nci; i++) ok = fprintf(fc, "%08X\t%s\n", ci[i].crc, ci[i].name) > 0;
+        if (fc && fclose(fc)) ok = 0;
+        if (!ok || rename(tp, cp)) { unlink(tp); die("can't write %s", cp); }
+        printf("checksums: %d file(s) listed in checksum.sr (CRC-32C)\n", nci); fflush(stdout);
+        if (verify_pass) {                       /* read everything back from the drive and check it against the list */
+            double tv = now(); int ok_n = 0;
+            for (int i = 0; i < nci; i++) {
+                char fp[4096]; snprintf(fp, sizeof fp, "%s/%s", outdir, ci[i].name); uint32_t c;
+                if (crc32c_file(fp, 1, &c)) { fprintf(stderr, "dng2prr: verification: %s is missing or unreadable\n", ci[i].name); vbad++; }
+                else if (c != ci[i].crc) { fprintf(stderr, "dng2prr: verification: CHECKSUM ERROR in %s (%08X on the drive, %08X written)\n", ci[i].name, c, ci[i].crc); vbad++; }
+                else ok_n++;
+                if ((i + 1) % 25 == 0 || i + 1 == nci) { printf("  verified %d/%d\n", i + 1, nci); fflush(stdout); }
+            }
+            printf("verification pass: %d of %d file(s) OK%s (%.1f s)\n", ok_n, nci, vbad ? ", CHECKSUM ERRORS" : ", no checksum errors", now() - tv);
+        }
+    }
     printf("done: %d written, %d skipped, %.1f MB -> %.1f MB (%.2f:1), %.1f fps%s\n",
            nf - j.skipped, j.skipped, j.in_bytes / 1e6, j.out_bytes / 1e6, j.out_bytes ? (double)j.in_bytes / j.out_bytes : 0,
            (nf - j.skipped) / (el > 0 ? el : 1), verify ? (mode.kind == M_LOSSY ? "" : ", verified lossless") : "");
     if (verify && mode.kind == M_LOSSY && j.err_frames) printf("verify: decoded fine; mean max error %.1f DN\n", j.max_err_sum / j.err_frames);
-    return 0;
+    return vbad ? 4 : 0;
 }
 
 /* The frame's DNG minus its image: a small TIFF holding every tag of IFD0 and its sub-IFDs
@@ -1107,6 +1335,7 @@ int main(int argc, char **argv) {
     int scale = 1, limit = 0, jobs = (int)sysconf(_SC_NPROCESSORS_ONLN), every = 25, list = 0, fps_n = 0, fps_d = 0;
     int have_neutral = 0, have_gain = 0; double neutral[2] = {1, 1}, gain = 1;
     const char *cdng_out = NULL, *cdng_mode = "lossless"; int copy_other = 0, verify = 0, skip_existing = 0, gyro_jsonl = 0, use_gpu = 1;
+    int downscale = 0, premiere = 0, checksums = 0, verify_pass = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         #define NEXT() (i + 1 < argc ? argv[++i] : (usage(), ""))
@@ -1126,6 +1355,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--copy-other")) copy_other = 1;
         else if (!strcmp(a, "--verify")) verify = 1;
         else if (!strcmp(a, "--skip-existing")) skip_existing = 1;
+        else if (!strcmp(a, "--downscale")) downscale = 1;
+        else if (!strcmp(a, "--premiere")) premiere = 1;
+        else if (!strcmp(a, "--checksums")) checksums = 1;
+        else if (!strcmp(a, "--verify-pass")) verify_pass = 1;
         else if (!strcmp(a, "--no-extra")) g_extra = 0;
         else if (!strcmp(a, "--no-gyro")) g_gyro = 0;
         else if (!strcmp(a, "--cpu")) use_gpu = 0;
@@ -1157,7 +1390,7 @@ int main(int argc, char **argv) {
         else printf("GPU: not available (%s); CPU only\n", err);
     }
 #endif
-    if (cdng_out) return run_cdng(cdng_out, cdng_mode, inputs, ninputs, jobs, copy_other, verify, skip_existing);
+    if (cdng_out) return run_cdng(cdng_out, cdng_mode, inputs, ninputs, jobs, copy_other, verify, skip_existing, downscale, premiere, checksums, verify_pass);
     if (!out || !ninputs) usage();
 
     char **files = NULL; int nf = 0;
